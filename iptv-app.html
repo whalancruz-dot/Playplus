@@ -182,7 +182,13 @@ function useXtream(session) {
     return res.json();
   }
 
-  return { ...state, fetchSeriesInfo };
+  async function fetchMovieInfo(vodId) {
+    const url = `${session.server}/player_api.php?username=${encodeURIComponent(session.user)}&password=${encodeURIComponent(session.pass)}&action=get_vod_info&vod_id=${encodeURIComponent(String(vodId))}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    return res.json();
+  }
+
+  return { ...state, fetchSeriesInfo, fetchMovieInfo };
 }
 
 /* ============================== Progress hook ============================== */
@@ -250,32 +256,60 @@ function Poster({ item, onClick, wide }) {
       onClick={onClick}
       className={`snap-item shrink-0 ${wide ? 'w-[220px]' : 'w-[136px]'} text-left group focus:outline-none`}
     >
-      <div className={`relative ${wide ? 'aspect-video' : 'aspect-[2/3]'} rounded-md overflow-hidden bg-base-card ring-1 ring-white/5 transition-transform duration-200 group-hover:scale-[1.04] group-active:scale-[0.98]`}>
+      <div className={`relative ${wide ? 'aspect-video' : 'aspect-[2/3]'} rounded-md overflow-hidden bg-base-card ring-1 ring-white/5 shadow-md shadow-black/40 transition-transform duration-200 group-hover:scale-[1.04] group-active:scale-[0.97]`}>
         {img ? (
           <img src={img} loading="lazy" className="w-full h-full object-cover" onError={(e)=>{e.target.style.display='none';}} />
         ) : (
           <div className="w-full h-full flex items-center justify-center text-2xl text-white/20">🎬</div>
         )}
-        <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+        <div className="absolute inset-0 bg-gradient-to-t from-black/40 via-transparent to-transparent" />
       </div>
       <p className="mt-1.5 text-[12.5px] leading-snug text-white/85 line-clamp-2">{item.name || item.title}</p>
     </button>
   );
 }
 
-function ProgressPoster({ p, onClick, onRemove }) {
+function ProgressPoster({ p, onClick, onDetails, onRemove }) {
+  const [menuOpen, setMenuOpen] = useState(false);
   const pct = Math.min(100, Math.round((p.time / p.duration) * 100));
   return (
-    <div className="snap-item shrink-0 w-[220px] text-left">
-      <button onClick={onClick} className="relative w-full aspect-video rounded-md overflow-hidden bg-base-card ring-1 ring-white/5 block">
-        {p.poster ? <img src={p.poster} className="w-full h-full object-cover" /> : <div className="w-full h-full flex items-center justify-center text-2xl text-white/20">▶</div>}
-        <div className="absolute inset-x-0 bottom-0 h-1 bg-white/20">
+    <div className="snap-item shrink-0 w-[248px] text-left">
+      <div className="relative w-full aspect-video rounded-lg overflow-hidden bg-base-card ring-1 ring-white/10 shadow-lg shadow-black/50">
+        <button onClick={onClick} className="absolute inset-0 w-full h-full text-left group">
+          {p.poster ? (
+            <img src={p.poster} className="w-full h-full object-cover transition-transform duration-300 group-active:scale-105" onError={(e)=>{e.target.style.display='none';}} />
+          ) : (
+            <div className="w-full h-full bg-gradient-to-br from-[#241417] via-base-card to-base-line/50 flex items-center justify-center">
+              <span className="text-4xl opacity-20">🎬</span>
+            </div>
+          )}
+          <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/10 to-black/25" />
+          <div className="absolute inset-0 flex items-center justify-center opacity-0 group-active:opacity-100 transition-opacity">
+            <div className="w-11 h-11 rounded-full bg-white/20 backdrop-blur flex items-center justify-center text-lg">▶</div>
+          </div>
+          <div className="absolute left-3 right-3 bottom-4">
+            <p className="text-[13.5px] font-medium leading-snug line-clamp-2 drop-shadow">{p.title}{p.extraTitle ? ` — ${p.extraTitle}` : ''}</p>
+          </div>
+        </button>
+
+        <button
+          onClick={(e) => { e.stopPropagation(); setMenuOpen((s) => !s); }}
+          className="absolute top-2 right-2 w-8 h-8 rounded-full bg-black/55 hover:bg-black/70 backdrop-blur flex items-center justify-center text-white text-base leading-none z-10"
+        >⋮</button>
+
+        <div className="absolute inset-x-0 bottom-0 h-1 bg-white/15">
           <div className="h-full bg-brand-red" style={{ width: pct + '%' }} />
         </div>
-      </button>
-      <div className="flex items-start justify-between gap-2 mt-1.5">
-        <p className="text-[12.5px] leading-snug text-white/85 line-clamp-2">{p.title}{p.extraTitle ? ` — ${p.extraTitle}` : ''}</p>
-        <button onClick={(e)=>{e.stopPropagation(); onRemove();}} className="text-white/40 hover:text-white/80 text-xs shrink-0 mt-0.5">✕</button>
+
+        {menuOpen && (
+          <>
+            <div className="fixed inset-0 z-10" onClick={() => setMenuOpen(false)} />
+            <div className="absolute right-2 top-11 bg-[#1c1c1c] border border-white/10 rounded-md overflow-hidden z-20 shadow-2xl min-w-[140px]">
+              <button onClick={(e)=>{e.stopPropagation(); setMenuOpen(false); onDetails();}} className="w-full text-left px-4 py-2.5 text-[13px] hover:bg-white/10">Detalhes</button>
+              <button onClick={(e)=>{e.stopPropagation(); setMenuOpen(false); onRemove();}} className="w-full text-left px-4 py-2.5 text-[13px] text-red-300 hover:bg-white/10">Remover</button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -285,9 +319,9 @@ function Row({ title, children }) {
   const list = Array.isArray(children) ? children.filter(Boolean) : (children ? [children] : []);
   if (list.length === 0) return null;
   return (
-    <section className="mb-7">
-      <h2 className="text-[15px] font-semibold text-white/90 mb-2.5 px-4 sm:px-8">{title}</h2>
-      <div className="flex gap-3 overflow-x-auto hide-scrollbar snap-row px-4 sm:px-8 pb-1">
+    <section className="mb-8">
+      <h2 className="text-[16px] font-semibold text-white/95 mb-3 px-4 sm:px-8 tracking-tight">{title}</h2>
+      <div className="flex gap-3.5 overflow-x-auto hide-scrollbar snap-row px-4 sm:px-8 pb-1">
         {list}
       </div>
     </section>
@@ -463,7 +497,7 @@ function SeriesDetail({ series, fetchSeriesInfo, onClose, onPlayEpisode, progres
 
         {!loading && continueEp && (
           <button
-            onClick={() => onPlayEpisode(continueEp.ep, series.name, series.series_id)}
+            onClick={() => onPlayEpisode(continueEp.ep, series.name, series.series_id, series.cover)}
             className="w-full flex items-center gap-3 bg-base-card hover:bg-base-line/60 rounded-lg p-3 mb-6 text-left"
           >
             <div className="w-10 h-10 rounded-full bg-brand-red/90 flex items-center justify-center text-sm shrink-0">▶</div>
@@ -506,7 +540,7 @@ function SeriesDetail({ series, fetchSeriesInfo, onClose, onPlayEpisode, progres
                 const p = progressMap[`episode-${ep.id}`];
                 const pct = p && p.duration ? Math.min(100, Math.round((p.time / p.duration) * 100)) : 0;
                 return (
-                  <button key={ep.id} onClick={() => onPlayEpisode(ep, series.name, series.series_id)}
+                  <button key={ep.id} onClick={() => onPlayEpisode(ep, series.name, series.series_id, series.cover)}
                     className="w-full flex items-center gap-3 bg-base-card hover:bg-base-line/60 rounded-lg px-3.5 py-3 text-left overflow-hidden relative">
                     <div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center text-[13px] text-white/70 shrink-0">{ep.episode_num}</div>
                     <span className="text-sm flex-1 min-w-0 truncate">{ep.title || `Episódio ${ep.episode_num}`}</span>
@@ -524,6 +558,74 @@ function SeriesDetail({ series, fetchSeriesInfo, onClose, onPlayEpisode, progres
         )}
 
         {!loading && seasons.length === 0 && <p className="text-white/50 text-sm">Nenhum episódio encontrado.</p>}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== Movie Detail ============================== */
+function MovieDetail({ movie, fetchMovieInfo, onClose, onPlay, progressMap }) {
+  const [info, setInfo] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetchMovieInfo(movie.stream_id).then((d) => { setInfo(d); setLoading(false); }).catch(() => setLoading(false));
+  }, [movie]);
+
+  const p = progressMap[`movie-${movie.stream_id}`];
+  const inProgress = p && p.duration > 0 && p.time > 5 && p.time < p.duration * 0.95;
+  const pct = inProgress ? Math.min(100, Math.round((p.time / p.duration) * 100)) : 0;
+
+  const meta = info && info.info ? info.info : null;
+  const backdrop = (meta && meta.backdrop_path && meta.backdrop_path[0]) || movie.stream_icon || '';
+  const plot = meta && meta.plot;
+  const genre = meta && meta.genre;
+  const duration = meta && meta.duration;
+  const rating = meta && (meta.rating_5based || meta.rating);
+
+  return (
+    <div className="fixed inset-0 z-40 bg-base-black overflow-y-auto">
+      <div className="relative h-64 sm:h-80 w-full bg-cover bg-center" style={{ backgroundImage: `url(${backdrop})` }}>
+        <div className="absolute inset-0 bg-gradient-to-t from-base-black via-base-black/50 to-black/40" />
+        <div className="absolute inset-0 bg-gradient-to-b from-black/50 via-transparent to-transparent" />
+        <button onClick={onClose}
+          className="absolute left-4 w-9 h-9 rounded-full bg-black/60 backdrop-blur flex items-center justify-center text-lg z-10"
+          style={{ top: 'calc(14px + env(safe-area-inset-top, 0px))' }}>←</button>
+        <div className="absolute bottom-0 left-0 right-0 px-4 sm:px-8 pb-4">
+          <h1 className="text-2xl sm:text-3xl font-display tracking-wide drop-shadow-lg">{movie.name}</h1>
+        </div>
+      </div>
+
+      <div className="px-4 sm:px-8 py-5" style={{ paddingBottom: 'calc(24px + env(safe-area-inset-bottom, 0px))' }}>
+        {loading && <Spinner />}
+
+        {!loading && (
+          <>
+            {(genre || duration || rating) && (
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-white/50 mb-3">
+                {genre && <span>{genre}</span>}
+                {duration && <span>{duration}</span>}
+                {rating ? <span>★ {rating}</span> : null}
+              </div>
+            )}
+            {plot && <p className="text-sm text-white/60 mb-6 max-w-2xl">{plot}</p>}
+
+            {inProgress && (
+              <div className="mb-4">
+                <div className="h-1 bg-white/15 rounded-full overflow-hidden mb-1">
+                  <div className="h-full bg-brand-red" style={{ width: pct + '%' }} />
+                </div>
+                <p className="text-[12px] text-white/40">Você já assistiu {pct}%</p>
+              </div>
+            )}
+
+            <div className="flex gap-3">
+              <button onClick={() => onPlay(movie)} className="flex-1 flex items-center justify-center gap-2 bg-brand-red hover:bg-red-600 transition-colors rounded-md py-3 text-[15px] font-semibold">
+                ▶ {inProgress ? 'Continuar assistindo' : 'Assistir'}
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -805,47 +907,52 @@ function CategoryRows({ items, categories, kind, onOpen, limit }) {
 
 function AppContent() {
   const { session, logout } = useAuth();
-  const { loading, error, data, fetchSeriesInfo } = useXtream(session);
+  const { loading, error, data, fetchSeriesInfo, fetchMovieInfo } = useXtream(session);
   const { save: saveProgress, remove: removeProgress, continueList, map: progressMap } = useProgress();
   const { history, add: addHistory, clear: clearHistory } = useSearchHistory();
 
   const [tab, setTab] = useState('home');
   const [playable, setPlayable] = useState(null);
   const [openSeries, setOpenSeries] = useState(null);
+  const [openMovie, setOpenMovie] = useState(null);
 
   function extFor(item, fallback) { return item.container_extension || fallback; }
 
+  function playMovie(item) {
+    const ext = extFor(item, 'mp4');
+    const url = `${session.server}/movie/${encodeURIComponent(session.user)}/${encodeURIComponent(session.pass)}/${item.stream_id}.${ext}`;
+    const key = `movie-${item.stream_id}`;
+    setOpenMovie(null);
+    setPlayable({
+      key, url, title: item.name,
+      onProgress: (time, duration) => saveProgress({ key, type: 'movie', id: item.stream_id, title: item.name, poster: item.stream_icon, time, duration, updatedAt: Date.now() }),
+    });
+  }
+
   function openItem(item, kind) {
     if (kind === 'series') { setOpenSeries(item); return; }
-    if (kind === 'movie') {
-      const ext = extFor(item, 'mp4');
-      const url = `${session.server}/movie/${encodeURIComponent(session.user)}/${encodeURIComponent(session.pass)}/${item.stream_id}.${ext}`;
-      const key = `movie-${item.stream_id}`;
-      setPlayable({
-        key, url, title: item.name,
-        onProgress: (time, duration) => saveProgress({ key, type: 'movie', id: item.stream_id, title: item.name, poster: item.stream_icon, time, duration, updatedAt: Date.now() }),
-      });
-    } else if (kind === 'live') {
+    if (kind === 'movie') { setOpenMovie(item); return; }
+    if (kind === 'live') {
       const url = `${session.server}/live/${encodeURIComponent(session.user)}/${encodeURIComponent(session.pass)}/${item.stream_id}.m3u8`;
       setPlayable({ key: `live-${item.stream_id}`, url, title: item.name, isLive: true, onProgress: () => {} });
     }
   }
 
-  function playEpisode(ep, seriesName, seriesId) {
+  function playEpisode(ep, seriesName, seriesId, seriesCover) {
     const ext = ep.container_extension || 'mp4';
     const url = `${session.server}/series/${encodeURIComponent(session.user)}/${encodeURIComponent(session.pass)}/${ep.id}.${ext}`;
     const key = `episode-${ep.id}`;
     setOpenSeries(null);
     setPlayable({
       key, url, title: `${seriesName} — Ep. ${ep.episode_num}`,
-      onProgress: (time, duration) => saveProgress({ key, type: 'episode', id: ep.id, seriesId, title: seriesName, extraTitle: `Ep. ${ep.episode_num}`, ext, time, duration, updatedAt: Date.now() }),
+      onProgress: (time, duration) => saveProgress({ key, type: 'episode', id: ep.id, seriesId, title: seriesName, extraTitle: `Ep. ${ep.episode_num}`, poster: seriesCover, ext, time, duration, updatedAt: Date.now() }),
     });
   }
 
   function resumeContinue(p) {
     if (p.type === 'movie') {
       const item = data.movies.find((m) => String(m.stream_id) === String(p.id));
-      if (item) openItem(item, 'movie');
+      if (item) playMovie(item);
     } else if (p.type === 'episode') {
       const ext = p.ext || 'mp4';
       const url = `${session.server}/series/${encodeURIComponent(session.user)}/${encodeURIComponent(session.pass)}/${p.id}.${ext}`;
@@ -853,6 +960,15 @@ function AppContent() {
         key: p.key, url, title: `${p.title} — ${p.extraTitle || ''}`,
         onProgress: (time, duration) => saveProgress({ ...p, time, duration, updatedAt: Date.now() }),
       });
+    }
+  }
+
+  function openDetailsForProgress(p) {
+    if (p.type === 'movie') {
+      const item = data.movies.find((m) => String(m.stream_id) === String(p.id));
+      if (item) setOpenMovie(item);
+    } else if (p.type === 'episode') {
+      setOpenSeries({ series_id: p.seriesId, name: p.title, cover: p.poster });
     }
   }
 
@@ -874,7 +990,7 @@ function AppContent() {
           {continueList.length > 0 && (
             <Row title="Continuar a Ver">
               {continueList.map((p) => (
-                <ProgressPoster key={p.key} p={p} onClick={() => resumeContinue(p)} onRemove={() => removeProgress(p.key)} />
+                <ProgressPoster key={p.key} p={p} onClick={() => resumeContinue(p)} onDetails={() => openDetailsForProgress(p)} onRemove={() => removeProgress(p.key)} />
               ))}
             </Row>
           )}
@@ -910,6 +1026,7 @@ function AppContent() {
 
       {playable && <VideoPlayer playable={playable} onClose={() => setPlayable(null)} progress={progressMap} />}
       {openSeries && <SeriesDetail series={openSeries} fetchSeriesInfo={fetchSeriesInfo} onClose={() => setOpenSeries(null)} onPlayEpisode={playEpisode} progressMap={progressMap} />}
+      {openMovie && <MovieDetail movie={openMovie} fetchMovieInfo={fetchMovieInfo} onClose={() => setOpenMovie(null)} onPlay={playMovie} progressMap={progressMap} />}
     </div>
   );
 }
