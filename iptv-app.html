@@ -1,0 +1,998 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>PLAY+</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.25.6/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.13/hls.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          base: { black: '#0a0a0a', dark: '#141414', card: '#1c1c1c', line: '#2a2a2a' },
+          brand: { red: '#e50914', redDim: '#8c060d' },
+        },
+        fontFamily: {
+          display: ['"Bebas Neue"', 'sans-serif'],
+          sans: ['Inter', 'system-ui', 'sans-serif'],
+        },
+      },
+    },
+  };
+</script>
+
+<style>
+  :root { box-sizing: border-box; }
+  *, *::before, *::after { box-sizing: inherit; }
+  html, body { height: 100%; }
+  html { scroll-padding-top: env(safe-area-inset-top, 0px); }
+  body { margin: 0; background: #0a0a0a; color: #ededed; font-family: Inter, system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  #root { min-height: 100%; }
+  .hide-scrollbar::-webkit-scrollbar { display: none; }
+  .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  .snap-row { scroll-snap-type: x proximity; }
+  .snap-item { scroll-snap-align: start; }
+  @keyframes shake { 10%,90%{transform:translateX(-1px)} 20%,80%{transform:translateX(2px)} 30%,50%,70%{transform:translateX(-4px)} 40%,60%{transform:translateX(4px)} }
+  #boot-error { display:none; position:fixed; inset:0; background:#0a0a0a; color:#fca5a5; padding:20px; font-family:monospace; font-size:13px; white-space:pre-wrap; overflow:auto; z-index:9999; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div id="boot-error"></div>
+<script>
+  window.addEventListener('error', function (e) {
+    var el = document.getElementById('boot-error');
+    if (el) { el.style.display = 'block'; el.textContent = 'Erro ao carregar o app:\n' + (e.error && e.error.stack ? e.error.stack : e.message); }
+  });
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback, useMemo, createContext, useContext } = React;
+
+/* ============================== IndexedDB helper ============================== */
+const DB_NAME = 'playplus_db';
+const STORE = 'kv';
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbSet(key, value) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function idbGet(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/* ============================== Auth Context ============================== */
+const AuthContext = createContext(null);
+
+function normalizeServer(raw) {
+  let s = raw.trim();
+  if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
+  return s.replace(/\/+$/, '');
+}
+
+function AuthProvider({ children }) {
+  const [session, setSession] = useState(null);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    idbGet('session').then((s) => { if (s) setSession(s); setReady(true); }).catch(() => setReady(true));
+  }, []);
+
+  const login = useCallback(async (name, serverRaw, user, pass) => {
+    const server = normalizeServer(serverRaw);
+    const url = `${server}/player_api.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    if (!res.ok) throw new Error('http_error');
+    const info = await res.json();
+    if (!info || !info.user_info || String(info.user_info.auth) !== '1') throw new Error('auth_failed');
+    const s = { name: name || 'Minha playlist', server, user, pass };
+    await idbSet('session', s);
+    setSession(s);
+    return s;
+  }, []);
+
+  const logout = useCallback(async () => {
+    await idbSet('session', null);
+    setSession(null);
+  }, []);
+
+  return (
+    <AuthContext.Provider value={{ session, login, logout, ready }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+function useAuth() { return useContext(AuthContext); }
+
+/* ============================== Xtream data hook ============================== */
+function useXtream(session) {
+  const [state, setState] = useState({ loading: false, error: null, data: null });
+
+  useEffect(() => {
+    if (!session) return;
+    let cancelled = false;
+    setState({ loading: true, error: null, data: null });
+
+    async function api(action) {
+      const url = `${session.server}/player_api.php?username=${encodeURIComponent(session.user)}&password=${encodeURIComponent(session.pass)}&action=${action}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+      if (!res.ok) throw new Error('http_error');
+      return res.json();
+    }
+
+    (async () => {
+      try {
+        const [movieCats, movies, seriesCats, series, liveCats, live] = await Promise.all([
+          api('get_vod_categories').catch(() => []),
+          api('get_vod_streams').catch(() => []),
+          api('get_series_categories').catch(() => []),
+          api('get_series').catch(() => []),
+          api('get_live_categories').catch(() => []),
+          api('get_live_streams').catch(() => []),
+        ]);
+        const withLc = (arr) => (Array.isArray(arr) ? arr : []).map((it) => ({ ...it, name_lc: (it.name || it.title || '').toLowerCase() }));
+        if (!cancelled) setState({
+          loading: false, error: null, data: {
+            movieCats: Array.isArray(movieCats) ? movieCats : [],
+            movies: withLc(movies),
+            seriesCats: Array.isArray(seriesCats) ? seriesCats : [],
+            series: withLc(series),
+            liveCats: Array.isArray(liveCats) ? liveCats : [],
+            live: withLc(live),
+          }
+        });
+      } catch (e) {
+        if (!cancelled) setState({ loading: false, error: 'Não foi possível carregar o conteúdo do servidor.', data: null });
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [session]);
+
+  async function fetchSeriesInfo(seriesId) {
+    const url = `${session.server}/player_api.php?username=${encodeURIComponent(session.user)}&password=${encodeURIComponent(session.pass)}&action=get_series_info&series_id=${encodeURIComponent(String(seriesId))}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+    return res.json();
+  }
+
+  return { ...state, fetchSeriesInfo };
+}
+
+/* ============================== Progress hook ============================== */
+function useProgress() {
+  const [map, setMap] = useState({});
+  useEffect(() => { idbGet('progress').then((m) => setMap(m || {})); }, []);
+
+  const save = useCallback((p) => {
+    setMap((prev) => {
+      const next = { ...prev, [p.key]: p };
+      idbSet('progress', next);
+      return next;
+    });
+  }, []);
+
+  const remove = useCallback((key) => {
+    setMap((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      idbSet('progress', next);
+      return next;
+    });
+  }, []);
+
+  const continueList = useMemo(() => {
+    return Object.values(map)
+      .filter((p) => p.duration > 0 && p.time > 5 && p.time < p.duration * 0.95)
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+  }, [map]);
+
+  return { map, save, remove, continueList };
+}
+
+/* ============================== Search history hook ============================== */
+function useSearchHistory() {
+  const [history, setHistory] = useState([]);
+  useEffect(() => { idbGet('searchHistory').then((h) => setHistory(h || [])); }, []);
+  const add = useCallback((term) => {
+    const t = (term || '').trim();
+    if (!t) return;
+    setHistory((prev) => {
+      const next = [t, ...prev.filter((x) => x.toLowerCase() !== t.toLowerCase())].slice(0, 10);
+      idbSet('searchHistory', next);
+      return next;
+    });
+  }, []);
+  const clear = useCallback(() => { setHistory([]); idbSet('searchHistory', []); }, []);
+  return { history, add, clear };
+}
+
+/* ============================== Small UI atoms ============================== */
+function Spinner() {
+  return (
+    <div className="flex items-center justify-center py-20">
+      <div className="w-9 h-9 border-2 rounded-full animate-spin"
+           style={{ borderColor: '#2a2a2a', borderTopColor: '#e50914' }} />
+    </div>
+  );
+}
+
+function Poster({ item, onClick, wide }) {
+  const img = item.stream_icon || item.cover || '';
+  return (
+    <button
+      onClick={onClick}
+      className={`snap-item shrink-0 ${wide ? 'w-[220px]' : 'w-[136px]'} text-left group focus:outline-none`}
+    >
+      <div className={`relative ${wide ? 'aspect-video' : 'aspect-[2/3]'} rounded-md overflow-hidden bg-base-card ring-1 ring-white/5 transition-transform duration-200 group-hover:scale-[1.04] group-active:scale-[0.98]`}>
+        {img ? (
+          <img src={img} loading="lazy" className="w-full h-full object-cover" onError={(e)=>{e.target.style.display='none';}} />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center text-2xl text-white/20">🎬</div>
+        )}
+        <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
+      </div>
+      <p className="mt-1.5 text-[12.5px] leading-snug text-white/85 line-clamp-2">{item.name || item.title}</p>
+    </button>
+  );
+}
+
+function ProgressPoster({ p, onClick, onRemove }) {
+  const pct = Math.min(100, Math.round((p.time / p.duration) * 100));
+  return (
+    <div className="snap-item shrink-0 w-[220px] text-left">
+      <button onClick={onClick} className="relative w-full aspect-video rounded-md overflow-hidden bg-base-card ring-1 ring-white/5 block">
+        {p.poster ? <img src={p.poster} className="w-full h-full object-cover" /> : <div className="w-full h-full flex items-center justify-center text-2xl text-white/20">▶</div>}
+        <div className="absolute inset-x-0 bottom-0 h-1 bg-white/20">
+          <div className="h-full bg-brand-red" style={{ width: pct + '%' }} />
+        </div>
+      </button>
+      <div className="flex items-start justify-between gap-2 mt-1.5">
+        <p className="text-[12.5px] leading-snug text-white/85 line-clamp-2">{p.title}{p.extraTitle ? ` — ${p.extraTitle}` : ''}</p>
+        <button onClick={(e)=>{e.stopPropagation(); onRemove();}} className="text-white/40 hover:text-white/80 text-xs shrink-0 mt-0.5">✕</button>
+      </div>
+    </div>
+  );
+}
+
+function Row({ title, children }) {
+  const list = Array.isArray(children) ? children.filter(Boolean) : (children ? [children] : []);
+  if (list.length === 0) return null;
+  return (
+    <section className="mb-7">
+      <h2 className="text-[15px] font-semibold text-white/90 mb-2.5 px-4 sm:px-8">{title}</h2>
+      <div className="flex gap-3 overflow-x-auto hide-scrollbar snap-row px-4 sm:px-8 pb-1">
+        {list}
+      </div>
+    </section>
+  );
+}
+
+function LiveRow({ item, onClick }) {
+  return (
+    <button onClick={onClick} className="snap-item shrink-0 w-[104px] text-center focus:outline-none group">
+      <div className="w-full aspect-square rounded-md bg-base-card ring-1 ring-white/5 flex items-center justify-center overflow-hidden transition-transform group-active:scale-95">
+        {item.stream_icon ? <img src={item.stream_icon} className="w-full h-full object-contain p-2" onError={(e)=>{e.target.style.display='none';}} /> : <span className="text-xl">📡</span>}
+      </div>
+      <p className="mt-1 text-[11px] leading-snug text-white/70 line-clamp-2">{item.name}</p>
+    </button>
+  );
+}
+
+/* ============================== Video Player ============================== */
+function VideoPlayer({ playable, onClose, progress }) {
+  const videoRef = useRef(null);
+  const hlsRef = useRef(null);
+  const [err, setErr] = useState(null);
+  const lastSaveRef = useRef(0);
+
+  useEffect(() => {
+    const video = videoRef.current;
+
+    const isHls = playable.url.includes('.m3u8');
+    const nativeHls = video.canPlayType('application/vnd.apple.mpegurl') !== '';
+
+    if (isHls && nativeHls) {
+      // Safari/iOS tocam HLS nativamente — sem passar por fetch/CORS.
+      video.onerror = () => setErr('Falha ao reproduzir este canal.');
+      video.src = playable.url;
+    } else if (isHls && window.Hls && window.Hls.isSupported()) {
+      // Fora do Safari: hls.js precisa buscar a playlist e os segmentos via JS (fetch),
+      // o que exige CORS de verdade — servidores Xtream normalmente não liberam isso.
+      const hls = new window.Hls();
+      hlsRef.current = hls;
+      hls.loadSource(playable.url);
+      hls.attachMedia(video);
+      hls.on(window.Hls.Events.ERROR, (_, d) => {
+        if (d.fatal) setErr('Este canal não conseguiu tocar neste navegador (fora do Safari, TV ao vivo é limitada).');
+      });
+    } else if (isHls) {
+      setErr('TV ao vivo não é suportada neste navegador.');
+    } else {
+      video.onerror = () => setErr('Falha ao reproduzir este item.');
+      video.src = playable.url;
+    }
+
+    const resume = progress && progress[playable.key];
+    if (resume && resume.time > 3) {
+      const onLoaded = () => { try { video.currentTime = resume.time; } catch (e) {} };
+      video.addEventListener('loadedmetadata', onLoaded, { once: true });
+    }
+
+    function onTimeUpdate() {
+      const now = Date.now();
+      if (now - lastSaveRef.current > 4000 && video.duration && !isNaN(video.duration)) {
+        lastSaveRef.current = now;
+        playable.onProgress(video.currentTime, video.duration);
+      }
+    }
+    function onPauseOrEnd() {
+      if (video.duration && !isNaN(video.duration)) playable.onProgress(video.currentTime, video.duration);
+    }
+    video.addEventListener('timeupdate', onTimeUpdate);
+    video.addEventListener('pause', onPauseOrEnd);
+    video.addEventListener('ended', onPauseOrEnd);
+    function onWebkitEndFullscreen() {
+      // Entrar em Picture-in-Picture também dispara este evento — só fecha o player
+      // quando o usuário realmente saiu (não quando foi pra PiP).
+      if (video.webkitPresentationMode === 'picture-in-picture') return;
+      onClose();
+    }
+    video.addEventListener('webkitendfullscreen', onWebkitEndFullscreen);
+
+    return () => {
+      video.removeEventListener('timeupdate', onTimeUpdate);
+      video.removeEventListener('pause', onPauseOrEnd);
+      video.removeEventListener('ended', onPauseOrEnd);
+      video.removeEventListener('webkitendfullscreen', onWebkitEndFullscreen);
+      if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+    };
+  }, [playable.url]);
+
+  function togglePip() {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.webkitSupportsPresentationMode && typeof video.webkitSetPresentationMode === 'function') {
+      video.webkitSetPresentationMode(video.webkitPresentationMode === 'picture-in-picture' ? 'inline' : 'picture-in-picture');
+      return;
+    }
+    if (document.pictureInPictureElement) {
+      document.exitPictureInPicture();
+    } else if (video.requestPictureInPicture) {
+      video.requestPictureInPicture().catch(() => setErr('Picture-in-Picture não é suportado neste navegador.'));
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black flex items-center justify-center" style={{ paddingTop: 'env(safe-area-inset-top, 0px)', paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}>
+      <video ref={videoRef} controls autoPlay playsInline webkit-playsinline="true" className="w-full h-full max-h-screen bg-black" />
+      <button
+        onClick={togglePip}
+        title="Picture-in-Picture"
+        className="absolute left-3 w-9 h-9 rounded-full bg-black/55 backdrop-blur flex items-center justify-center text-[15px] text-white/90"
+        style={{ bottom: 'calc(64px + env(safe-area-inset-bottom, 0px))' }}
+      >⧉</button>
+      {err && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-black px-6 text-center">
+          <p className="text-sm text-red-300">{err}</p>
+          <button onClick={onClose} className="text-white/60 text-sm underline">Fechar</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================== Series Detail ============================== */
+function SeriesDetail({ series, fetchSeriesInfo, onClose, onPlayEpisode, progressMap }) {
+  const [info, setInfo] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [seasonNum, setSeasonNum] = useState(null);
+  const [seasonMenuOpen, setSeasonMenuOpen] = useState(false);
+
+  useEffect(() => {
+    fetchSeriesInfo(series.series_id).then((d) => {
+      setInfo(d);
+      setLoading(false);
+      const seasons = d && d.episodes ? Object.keys(d.episodes) : [];
+      setSeasonNum(seasons[0] || null);
+    }).catch(() => setLoading(false));
+  }, [series]);
+
+  const continueEp = useMemo(() => {
+    if (!info || !info.episodes) return null;
+    const all = Object.values(info.episodes).flat();
+    let best = null;
+    for (const ep of all) {
+      const p = progressMap[`episode-${ep.id}`];
+      if (p && p.duration > 0 && p.time > 5 && p.time < p.duration * 0.95) {
+        if (!best || p.updatedAt > best.p.updatedAt) best = { ep, p };
+      }
+    }
+    return best;
+  }, [info, progressMap]);
+
+  const seasons = info && info.episodes ? Object.keys(info.episodes) : [];
+  const episodes = seasonNum && info && info.episodes ? info.episodes[seasonNum] : [];
+
+  return (
+    <div className="fixed inset-0 z-40 bg-base-black overflow-y-auto">
+      <div className="relative h-64 sm:h-80 w-full bg-cover bg-center" style={{ backgroundImage: `url(${series.cover || ''})` }}>
+        <div className="absolute inset-0 bg-gradient-to-t from-base-black via-base-black/50 to-black/40" />
+        <div className="absolute inset-0 bg-gradient-to-b from-black/50 via-transparent to-transparent" />
+        <button onClick={onClose}
+          className="absolute left-4 w-9 h-9 rounded-full bg-black/60 backdrop-blur flex items-center justify-center text-lg z-10"
+          style={{ top: 'calc(14px + env(safe-area-inset-top, 0px))' }}>←</button>
+        <div className="absolute bottom-0 left-0 right-0 px-4 sm:px-8 pb-4">
+          <h1 className="text-2xl sm:text-3xl font-display tracking-wide drop-shadow-lg">{series.name}</h1>
+        </div>
+      </div>
+
+      <div className="px-4 sm:px-8 py-5" style={{ paddingBottom: 'calc(24px + env(safe-area-inset-bottom, 0px))' }}>
+        {series.plot && <p className="text-sm text-white/60 mb-6 max-w-2xl">{series.plot}</p>}
+
+        {loading && <Spinner />}
+
+        {!loading && continueEp && (
+          <button
+            onClick={() => onPlayEpisode(continueEp.ep, series.name, series.series_id)}
+            className="w-full flex items-center gap-3 bg-base-card hover:bg-base-line/60 rounded-lg p-3 mb-6 text-left"
+          >
+            <div className="w-10 h-10 rounded-full bg-brand-red/90 flex items-center justify-center text-sm shrink-0">▶</div>
+            <div className="flex-1 min-w-0">
+              <p className="text-[13px] text-white/50">Continuar assistindo</p>
+              <p className="text-sm font-medium truncate">Ep. {continueEp.ep.episode_num} — {continueEp.ep.title || series.name}</p>
+              <div className="h-1 bg-white/15 rounded-full mt-1.5 overflow-hidden">
+                <div className="h-full bg-brand-red" style={{ width: Math.min(100, Math.round((continueEp.p.time / continueEp.p.duration) * 100)) + '%' }} />
+              </div>
+            </div>
+          </button>
+        )}
+
+        {!loading && seasons.length > 0 && (
+          <>
+            <div className="relative mb-4">
+              <button
+                onClick={() => setSeasonMenuOpen((s) => !s)}
+                className="flex items-center gap-2 bg-base-card border border-white/10 rounded-md px-3.5 py-2 text-sm font-medium"
+              >
+                Temporada {seasonNum} <span className={`text-white/50 transition-transform ${seasonMenuOpen ? 'rotate-180' : ''}`}>▾</span>
+              </button>
+              {seasonMenuOpen && (
+                <div className="absolute mt-1 bg-base-card border border-white/10 rounded-md overflow-hidden z-10 min-w-[160px] shadow-xl">
+                  {seasons.map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => { setSeasonNum(s); setSeasonMenuOpen(false); }}
+                      className={`w-full text-left px-3.5 py-2.5 text-sm hover:bg-white/10 ${s === seasonNum ? 'text-brand-red' : 'text-white/85'}`}
+                    >
+                      Temporada {s}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              {episodes.map((ep) => {
+                const p = progressMap[`episode-${ep.id}`];
+                const pct = p && p.duration ? Math.min(100, Math.round((p.time / p.duration) * 100)) : 0;
+                return (
+                  <button key={ep.id} onClick={() => onPlayEpisode(ep, series.name, series.series_id)}
+                    className="w-full flex items-center gap-3 bg-base-card hover:bg-base-line/60 rounded-lg px-3.5 py-3 text-left overflow-hidden relative">
+                    <div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center text-[13px] text-white/70 shrink-0">{ep.episode_num}</div>
+                    <span className="text-sm flex-1 min-w-0 truncate">{ep.title || `Episódio ${ep.episode_num}`}</span>
+                    <span className="text-brand-red text-sm shrink-0">▶</span>
+                    {pct > 0 && (
+                      <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-white/10">
+                        <div className="h-full bg-brand-red" style={{ width: pct + '%' }} />
+                      </div>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {!loading && seasons.length === 0 && <p className="text-white/50 text-sm">Nenhum episódio encontrado.</p>}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== Login Screen ============================== */
+function FloatingInput({ label, value, onChange, type = 'text', placeholder, autoComplete = 'off', rightSlot }) {
+  const [focused, setFocused] = useState(false);
+  const floated = focused || (value && value.length > 0);
+  return (
+    <div className="relative">
+      <input
+        value={value}
+        onChange={onChange}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        type={type}
+        autoComplete={autoComplete}
+        placeholder={floated ? (placeholder || '') : ''}
+        className={`peer w-full bg-white/[0.06] border rounded-lg px-3.5 pt-5 pb-2 text-base text-white placeholder:text-white/25 outline-none transition-colors ${focused ? 'border-brand-red' : 'border-white/10'} ${rightSlot ? 'pr-11' : ''}`}
+      />
+      <label className={`absolute left-3.5 transition-all pointer-events-none ${floated ? 'top-1.5 text-[10.5px] text-white/45' : 'top-1/2 -translate-y-1/2 text-[15px] text-white/40'}`}>
+        {label}
+      </label>
+      {rightSlot && <div className="absolute right-1 top-0 h-full flex items-center">{rightSlot}</div>}
+    </div>
+  );
+}
+
+function LoginScreen() {
+  const { login } = useAuth();
+  const [name, setName] = useState('');
+  const [server, setServer] = useState('http://onecine.link');
+  const [user, setUser] = useState('419320531');
+  const [pass, setPass] = useState('');
+  const [showPass, setShowPass] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [shake, setShake] = useState(false);
+
+  function fail(msg) {
+    setError(msg);
+    setShake(true);
+    setTimeout(() => setShake(false), 420);
+  }
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!server || !user || !pass) { fail('Preencha servidor, usuário e senha.'); return; }
+    setLoading(true); setError(null);
+    try {
+      await login(name, server, user, pass);
+    } catch (err) {
+      fail(err.message === 'auth_failed' ? 'Usuário ou senha inválidos.' : 'Não foi possível conectar ao servidor.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const tiles = useMemo(() => {
+    const hues = [355, 20, 265, 200, 340, 10, 250, 190, 0, 300, 30, 220];
+    return Array.from({ length: 24 }).map((_, i) => ({
+      hue: hues[i % hues.length],
+      light: 14 + ((i * 37) % 16),
+    }));
+  }, []);
+
+  return (
+    <div className="min-h-screen relative flex items-center justify-center px-5 overflow-hidden bg-black">
+      <div className="absolute inset-0 grid grid-cols-6 gap-1 opacity-70" style={{ filter: 'blur(1px)' }}>
+        {tiles.map((t, i) => (
+          <div key={i} className="aspect-[2/3]" style={{ background: `hsl(${t.hue} 55% ${t.light}%)` }} />
+        ))}
+      </div>
+      <div className="absolute inset-0" style={{ background: 'linear-gradient(to bottom, rgba(0,0,0,.75), rgba(0,0,0,.55) 40%, #0a0a0a 92%)' }} />
+      <div className="absolute inset-0" style={{ background: 'radial-gradient(ellipse at center, transparent 0%, #000 88%)' }} />
+
+      <div className={`relative w-full max-w-[380px] bg-black/75 backdrop-blur-sm rounded-xl px-6 sm:px-10 py-9 ${shake ? 'animate-[shake_.4s]' : ''}`} style={{ boxShadow: '0 20px 60px rgba(0,0,0,.6)' }}>
+        <h1 className="font-display text-[38px] leading-none tracking-widest text-brand-red text-center mb-1">PLAY+</h1>
+        <p className="text-center text-white/35 text-[13px] mb-7">Sua playlist Xtream, num só lugar</p>
+
+        <form onSubmit={submit} className="space-y-3">
+          <FloatingInput label="Nome da playlist (opcional)" value={name} onChange={(e)=>setName(e.target.value)} />
+          <FloatingInput label="URL do servidor" value={server} onChange={(e)=>setServer(e.target.value)} placeholder="http://dominio.com:8080" />
+          <FloatingInput label="Usuário" value={user} onChange={(e)=>setUser(e.target.value)} />
+          <FloatingInput
+            label="Senha" value={pass} onChange={(e)=>setPass(e.target.value)} type={showPass ? 'text' : 'password'}
+            rightSlot={
+              <button type="button" onClick={() => setShowPass((s) => !s)} className="px-2.5 text-white/40 hover:text-white/75 text-xs font-medium">
+                {showPass ? 'Ocultar' : 'Mostrar'}
+              </button>
+            }
+          />
+
+          {error && (
+            <div className="flex items-center gap-2 bg-red-950/50 border border-red-900/60 rounded-md px-3 py-2.5">
+              <span className="text-brand-red text-sm">⚠</span>
+              <p className="text-red-300 text-[12.5px]">{error}</p>
+            </div>
+          )}
+
+          <button disabled={loading} type="submit"
+            className="w-full flex items-center justify-center gap-2 bg-brand-red hover:bg-red-600 disabled:opacity-70 transition-colors rounded-md py-3 text-[15px] font-semibold mt-3">
+            {loading && <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />}
+            {loading ? 'Conectando…' : 'Entrar'}
+          </button>
+        </form>
+
+        <p className="text-center text-white/25 text-[11px] mt-6 leading-relaxed">
+          Seus dados ficam salvos apenas neste dispositivo.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== Search Screen ============================== */
+const RESULTS_LIMIT = 60;
+
+function SearchScreen({ data, onOpen, history, addHistory, clearHistory }) {
+  const [raw, setRaw] = useState('');
+  const [q, setQ] = useState('');
+
+  useEffect(() => {
+    const t = setTimeout(() => setQ(raw), 250);
+    return () => clearTimeout(t);
+  }, [raw]);
+
+  const { results, totalCount } = useMemo(() => {
+    if (!q.trim() || !data) return { results: [], totalCount: 0 };
+    const term = q.toLowerCase();
+    const movies = [];
+    const series = [];
+    const live = [];
+    for (const m of data.movies) { if (m.name_lc.includes(term)) movies.push(m); }
+    for (const s of data.series) { if (s.name_lc.includes(term)) series.push(s); }
+    for (const l of data.live) { if (l.name_lc.includes(term)) live.push(l); }
+    const total = movies.length + series.length + live.length;
+    const combined = [
+      ...movies.slice(0, RESULTS_LIMIT).map((m) => ({ ...m, __kind: 'movie' })),
+      ...series.slice(0, RESULTS_LIMIT).map((s) => ({ ...s, __kind: 'series' })),
+      ...live.slice(0, RESULTS_LIMIT).map((l) => ({ ...l, __kind: 'live' })),
+    ].slice(0, RESULTS_LIMIT);
+    return { results: combined, totalCount: total };
+  }, [q, data]);
+
+  const suggestions = useMemo(() => {
+    if (!data) return [];
+    const pool = [
+      ...data.movies.map((m) => ({ ...m, __kind: 'movie' })),
+      ...data.series.map((s) => ({ ...s, __kind: 'series' })),
+    ];
+    // amostragem pseudo-aleatória estável (não recalcula a cada render)
+    const step = Math.max(1, Math.floor(pool.length / 24) || 1);
+    const out = [];
+    for (let i = 0; i < pool.length && out.length < 24; i += step) out.push(pool[i]);
+    return out;
+  }, [data]);
+
+  return (
+    <div className="px-4 sm:px-8 pt-4 pb-10">
+      <div className="relative mb-6">
+        <span className="absolute left-4 top-1/2 -translate-y-1/2 text-white/40 text-2xl leading-none">⌕</span>
+        <input
+          value={raw}
+          onChange={(e) => setRaw(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') addHistory(raw); }}
+          onBlur={() => raw && addHistory(raw)}
+          placeholder="Filmes, séries…"
+          autoFocus
+          className="w-full bg-white/[0.07] border border-white/10 focus:border-white/25 rounded-lg pl-10 pr-10 py-3.5 text-base text-white placeholder:text-white/35 outline-none transition-colors"
+        />
+        {raw && (
+          <button onClick={() => setRaw('')} className="absolute right-3.5 top-1/2 -translate-y-1/2 w-5 h-5 rounded-full bg-white/15 hover:bg-white/25 text-white/70 text-[11px] flex items-center justify-center">✕</button>
+        )}
+      </div>
+
+      {!q && history.length > 0 && (
+        <div className="mb-7">
+          <div className="flex items-center justify-between mb-2.5">
+            <p className="text-[13px] font-medium text-white/60">Pesquisas recentes</p>
+            <button onClick={clearHistory} className="text-xs text-white/35 hover:text-white/65">Limpar</button>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {history.map((h) => (
+              <button key={h} onClick={() => setRaw(h)} className="text-[13px] bg-white/[0.07] hover:bg-white/[0.12] border border-white/10 rounded-full px-3.5 py-1.5 text-white/75 transition-colors">{h}</button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!q && suggestions.length > 0 && (
+        <div>
+          <p className="text-[13px] font-medium text-white/60 mb-2.5">Explorar</p>
+          <div className="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-6 gap-3">
+            {suggestions.map((item) => (
+              <div key={item.__kind + '-' + (item.stream_id || item.series_id)} className="w-full">
+                <Poster item={item} onClick={() => onOpen(item, item.__kind)} />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {q && (
+        <>
+          {totalCount > results.length && (
+            <p className="text-xs text-white/40 mb-3">Mostrando {results.length} de {totalCount} resultados — refine a busca para ver outros.</p>
+          )}
+          <div className="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-6 gap-3">
+            {results.map((item) => (
+              <div key={item.__kind + '-' + (item.stream_id || item.series_id)} className="w-full">
+                <Poster item={item} onClick={() => onOpen(item, item.__kind)} />
+              </div>
+            ))}
+            {results.length === 0 && <p className="text-white/40 text-sm col-span-full">Nenhum resultado para "{q}".</p>}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ============================== Main App Shell ============================== */
+const TABS = [
+  { id: 'home', label: 'Início' },
+  { id: 'movies', label: 'Filmes' },
+  { id: 'series', label: 'Séries' },
+  { id: 'live', label: 'TV ao Vivo' },
+  { id: 'search', label: 'Pesquisa' },
+];
+
+function Header({ tab, setTab, onLogout }) {
+  return (
+    <header className="sticky top-0 z-30 backdrop-blur bg-base-black/80 border-b border-base-line/60" style={{ paddingTop: 'env(safe-area-inset-top, 0px)' }}>
+      <div className="flex items-center justify-between px-4 sm:px-8 h-14">
+        <span className="font-display text-2xl tracking-widest text-brand-red">PLAY+</span>
+        <nav className="hidden sm:flex items-center gap-1">
+          {TABS.map((t) => (
+            <button key={t.id} onClick={() => setTab(t.id)}
+              className={`px-3 py-1.5 rounded-md text-sm transition-colors ${tab === t.id ? 'text-white bg-white/10' : 'text-white/55 hover:text-white/85'}`}>
+              {t.label}
+            </button>
+          ))}
+        </nav>
+        <button onClick={onLogout} className="text-xs text-white/40 hover:text-white/70">Sair</button>
+      </div>
+      <nav className="flex sm:hidden gap-1 px-3 pb-2 overflow-x-auto hide-scrollbar">
+        {TABS.map((t) => (
+          <button key={t.id} onClick={() => setTab(t.id)}
+            className={`shrink-0 px-3 py-1.5 rounded-full text-xs transition-colors ${tab === t.id ? 'bg-brand-red text-white' : 'bg-base-card text-white/60'}`}>
+            {t.label}
+          </button>
+        ))}
+      </nav>
+    </header>
+  );
+}
+
+function CategoryRows({ items, categories, kind, onOpen, limit }) {
+  const cats = (categories || []).slice(0, limit || categories.length);
+  return (
+    <>
+      {cats.map((c) => {
+        const list = items.filter((it) => String(it.category_id) === String(c.category_id)).slice(0, 20);
+        if (!list.length) return null;
+        return (
+          <Row key={c.category_id} title={c.category_name}>
+            {list.map((it) => kind === 'live'
+              ? <LiveRow key={it.stream_id} item={it} onClick={() => onOpen(it, kind)} />
+              : <Poster key={it.stream_id || it.series_id} item={it} onClick={() => onOpen(it, kind)} />
+            )}
+          </Row>
+        );
+      })}
+    </>
+  );
+}
+
+function AppContent() {
+  const { session, logout } = useAuth();
+  const { loading, error, data, fetchSeriesInfo } = useXtream(session);
+  const { save: saveProgress, remove: removeProgress, continueList, map: progressMap } = useProgress();
+  const { history, add: addHistory, clear: clearHistory } = useSearchHistory();
+
+  const [tab, setTab] = useState('home');
+  const [playable, setPlayable] = useState(null);
+  const [openSeries, setOpenSeries] = useState(null);
+
+  function extFor(item, fallback) { return item.container_extension || fallback; }
+
+  function openItem(item, kind) {
+    if (kind === 'series') { setOpenSeries(item); return; }
+    if (kind === 'movie') {
+      const ext = extFor(item, 'mp4');
+      const url = `${session.server}/movie/${encodeURIComponent(session.user)}/${encodeURIComponent(session.pass)}/${item.stream_id}.${ext}`;
+      const key = `movie-${item.stream_id}`;
+      setPlayable({
+        key, url, title: item.name,
+        onProgress: (time, duration) => saveProgress({ key, type: 'movie', id: item.stream_id, title: item.name, poster: item.stream_icon, time, duration, updatedAt: Date.now() }),
+      });
+    } else if (kind === 'live') {
+      const url = `${session.server}/live/${encodeURIComponent(session.user)}/${encodeURIComponent(session.pass)}/${item.stream_id}.m3u8`;
+      setPlayable({ key: `live-${item.stream_id}`, url, title: item.name, isLive: true, onProgress: () => {} });
+    }
+  }
+
+  function playEpisode(ep, seriesName, seriesId) {
+    const ext = ep.container_extension || 'mp4';
+    const url = `${session.server}/series/${encodeURIComponent(session.user)}/${encodeURIComponent(session.pass)}/${ep.id}.${ext}`;
+    const key = `episode-${ep.id}`;
+    setOpenSeries(null);
+    setPlayable({
+      key, url, title: `${seriesName} — Ep. ${ep.episode_num}`,
+      onProgress: (time, duration) => saveProgress({ key, type: 'episode', id: ep.id, seriesId, title: seriesName, extraTitle: `Ep. ${ep.episode_num}`, ext, time, duration, updatedAt: Date.now() }),
+    });
+  }
+
+  function resumeContinue(p) {
+    if (p.type === 'movie') {
+      const item = data.movies.find((m) => String(m.stream_id) === String(p.id));
+      if (item) openItem(item, 'movie');
+    } else if (p.type === 'episode') {
+      const ext = p.ext || 'mp4';
+      const url = `${session.server}/series/${encodeURIComponent(session.user)}/${encodeURIComponent(session.pass)}/${p.id}.${ext}`;
+      setPlayable({
+        key: p.key, url, title: `${p.title} — ${p.extraTitle || ''}`,
+        onProgress: (time, duration) => saveProgress({ ...p, time, duration, updatedAt: Date.now() }),
+      });
+    }
+  }
+
+  if (loading) return <div className="min-h-screen flex items-center justify-center"><Spinner /></div>;
+  if (error) return (
+    <div className="min-h-screen flex flex-col items-center justify-center gap-4 px-6 text-center">
+      <p className="text-white/60 text-sm max-w-sm">{error}</p>
+      <button onClick={logout} className="text-brand-red text-sm underline">Tentar com outra playlist</button>
+    </div>
+  );
+  if (!data) return null;
+
+  return (
+    <div className="min-h-screen pb-16">
+      <Header tab={tab} setTab={setTab} onLogout={logout} />
+
+      {tab === 'home' && (
+        <div className="pt-5">
+          {continueList.length > 0 && (
+            <Row title="Continuar a Ver">
+              {continueList.map((p) => (
+                <ProgressPoster key={p.key} p={p} onClick={() => resumeContinue(p)} onRemove={() => removeProgress(p.key)} />
+              ))}
+            </Row>
+          )}
+          <Row title="Filmes Adicionados Recentemente">
+            {[...data.movies].sort((a, b) => Number(b.added || 0) - Number(a.added || 0)).slice(0, 20)
+              .map((m) => <Poster key={m.stream_id} item={m} onClick={() => openItem(m, 'movie')} />)}
+          </Row>
+          <CategoryRows items={data.movies} categories={data.movieCats} kind="movie" onOpen={openItem} limit={8} />
+        </div>
+      )}
+
+      {tab === 'movies' && (
+        <div className="pt-5">
+          <CategoryRows items={data.movies} categories={data.movieCats} kind="movie" onOpen={openItem} />
+        </div>
+      )}
+
+      {tab === 'series' && (
+        <div className="pt-5">
+          <CategoryRows items={data.series} categories={data.seriesCats} kind="series" onOpen={openItem} />
+        </div>
+      )}
+
+      {tab === 'live' && (
+        <div className="pt-5">
+          <CategoryRows items={data.live} categories={data.liveCats} kind="live" onOpen={openItem} />
+        </div>
+      )}
+
+      {tab === 'search' && (
+        <SearchScreen data={data} onOpen={openItem} history={history} addHistory={addHistory} clearHistory={clearHistory} />
+      )}
+
+      {playable && <VideoPlayer playable={playable} onClose={() => setPlayable(null)} progress={progressMap} />}
+      {openSeries && <SeriesDetail series={openSeries} fetchSeriesInfo={fetchSeriesInfo} onClose={() => setOpenSeries(null)} onPlayEpisode={playEpisode} progressMap={progressMap} />}
+    </div>
+  );
+}
+
+/* ============================== Onboarding ============================== */
+function useOnboarding() {
+  const [seen, setSeen] = useState(null);
+  useEffect(() => { idbGet('onboarding_seen').then((v) => setSeen(!!v)); }, []);
+  const complete = useCallback(() => { idbSet('onboarding_seen', true); setSeen(true); }, []);
+  return { seen, complete };
+}
+
+const ONBOARDING_STEPS = [
+  { icon: '🎬', title: 'Bem-vindo ao PLAY+', text: 'Sua playlist Xtream, organizada do jeito que você merece assistir.' },
+  { icon: '🔍', title: 'Tudo num só lugar', text: 'Filmes e séries organizados por categoria, com busca rápida pra achar o que quiser.' },
+  { icon: '▶', title: 'Continue de onde parou', text: 'O app guarda o ponto exato em que você pausou — é só voltar e apertar play.' },
+];
+
+function Onboarding({ onDone }) {
+  const [step, setStep] = useState(0);
+  const touchX = useRef(null);
+  const last = step === ONBOARDING_STEPS.length - 1;
+
+  function next() { last ? onDone() : setStep((s) => s + 1); }
+  function back() { setStep((s) => Math.max(0, s - 1)); }
+
+  function onTouchStart(e) { touchX.current = e.touches[0].clientX; }
+  function onTouchEnd(e) {
+    if (touchX.current === null) return;
+    const dx = e.changedTouches[0].clientX - touchX.current;
+    if (dx < -40) next();
+    else if (dx > 40) back();
+    touchX.current = null;
+  }
+
+  const s = ONBOARDING_STEPS[step];
+
+  return (
+    <div className="min-h-screen bg-base-black flex flex-col" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+      <div className="flex justify-end px-5 pt-5" style={{ paddingTop: 'calc(20px + env(safe-area-inset-top, 0px))' }}>
+        {!last && <button onClick={onDone} className="text-white/40 hover:text-white/70 text-sm">Pular</button>}
+      </div>
+
+      <div className="flex-1 flex flex-col items-center justify-center px-8 text-center">
+        <div key={step} className="w-24 h-24 rounded-2xl bg-white/[0.06] border border-white/10 flex items-center justify-center text-5xl mb-8">
+          {s.icon}
+        </div>
+        <h1 className="font-display text-3xl tracking-wide mb-3">{s.title}</h1>
+        <p className="text-white/55 text-[15px] leading-relaxed max-w-xs">{s.text}</p>
+      </div>
+
+      <div className="px-8 pb-9" style={{ paddingBottom: 'calc(36px + env(safe-area-inset-bottom, 0px))' }}>
+        <div className="flex items-center justify-center gap-1.5 mb-6">
+          {ONBOARDING_STEPS.map((_, i) => (
+            <div key={i} className={`h-1.5 rounded-full transition-all ${i === step ? 'w-6 bg-brand-red' : 'w-1.5 bg-white/20'}`} />
+          ))}
+        </div>
+        <button onClick={next} className="w-full bg-brand-red hover:bg-red-600 transition-colors rounded-md py-3 text-[15px] font-semibold">
+          {last ? 'Começar' : 'Continuar'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Root() {
+  const { session, ready } = useAuth();
+  const { seen, complete } = useOnboarding();
+  if (!ready || seen === null) return <div className="min-h-screen bg-base-black" />;
+  if (session) return <AppContent />;
+  if (!seen) return <Onboarding onDone={complete} />;
+  return <LoginScreen />;
+}
+
+function App() {
+  return (
+    <AuthProvider>
+      <Root />
+    </AuthProvider>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
